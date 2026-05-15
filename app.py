@@ -2,8 +2,10 @@ import sqlite3
 try:
     import psycopg2
     from psycopg2.extras import RealDictCursor
+    from psycopg2 import pool as psycopg2_pool
 except Exception:
     psycopg2 = None
+    psycopg2_pool = None
     RealDictCursor = None
 from pathlib import Path
 from datetime import date, datetime
@@ -26,6 +28,20 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+
+
+@st.cache_resource(show_spinner=False)
+def get_pg_pool(database_url):
+    """Reutiliza conexões PostgreSQL no Streamlit Cloud para reduzir lentidão."""
+    if psycopg2 is None or psycopg2_pool is None:
+        return None
+    return psycopg2_pool.SimpleConnectionPool(
+        minconn=1,
+        maxconn=8,
+        dsn=database_url,
+        cursor_factory=RealDictCursor,
+    )
+
 
 DB_PATH = Path(__file__).with_name("mini_erp.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
@@ -1280,7 +1296,10 @@ class PgConnCompat:
     def __init__(self):
         if psycopg2 is None:
             raise RuntimeError("psycopg2-binary não está instalado. Adicione ao requirements.txt para usar PostgreSQL.")
-        self._conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+        self._pool = get_pg_pool(DATABASE_URL)
+        if self._pool is None:
+            raise RuntimeError("Pool PostgreSQL não pôde ser inicializado.")
+        self._conn = self._pool.getconn()
 
     def __enter__(self):
         return self
@@ -1288,7 +1307,7 @@ class PgConnCompat:
     def __exit__(self, exc_type, exc, tb):
         if exc_type:
             self._conn.rollback()
-        self._conn.close()
+        self._pool.putconn(self._conn)
         return False
 
     def _translate_sql(self, sql):
@@ -1298,9 +1317,12 @@ class PgConnCompat:
         if upper.startswith("PRAGMA") or "SQLITE_SEQUENCE" in upper:
             return None
         sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-        sql = sql.replace("?", "%s")
         sql = sql.replace("strftime('%d/%m/%Y', e.event_date)", "to_char(e.event_date::date, 'DD/MM/YYYY')")
-        sql = sql.replace("strftime(\"%d/%m/%Y\", e.event_date)", "to_char(e.event_date::date, 'DD/MM/YYYY')")
+        sql = sql.replace('strftime("%d/%m/%Y", e.event_date)', "to_char(e.event_date::date, 'DD/MM/YYYY')")
+        sql = sql.replace("?", "%s")
+        # psycopg2 usa %s como placeholder. Qualquer % literal em LIKE precisa virar %%.
+        # Ex.: LIKE '%AUTO%' -> LIKE '%%AUTO%%'. Sem isso, ocorre IndexError: tuple index out of range.
+        sql = re.sub(r"%(?!s)", "%%", sql)
         return sql
 
     def execute(self, sql, params=()):
@@ -1779,7 +1801,13 @@ def query_df(sql, params=()):
     with get_conn() as conn:
         if USE_POSTGRES:
             translated = conn._translate_sql(sql)
-            return pd.read_sql_query(translated, conn._conn, params=params)
+            if translated is None:
+                return pd.DataFrame()
+            cur = conn._conn.cursor()
+            cur.execute(translated, params or ())
+            columns = [desc[0] for desc in (cur.description or [])]
+            rows = cur.fetchall()
+            return pd.DataFrame(rows, columns=columns)
         return pd.read_sql_query(sql, conn, params=params)
 
 
