@@ -2389,12 +2389,7 @@ def command_options(status=None):
 
 
 def next_command_number():
-    df = query_df(
-        """
-        SELECT GREATEST(last_value + CASE WHEN is_called THEN 1 ELSE 0 END, 100) AS next_number
-        FROM command_number_seq
-        """
-    )
+    df = query_df("SELECT COALESCE(MAX(number), 99) + 1 AS next_number FROM commands")
     n = int(df["next_number"].iloc[0]) if not df.empty else 100
     return max(n, 100)
 
@@ -2465,8 +2460,9 @@ def create_command(opened_at, event_id, operator_id, customer_name, entry_type, 
     original_value = float(entry_value if entry_original_value is None else entry_original_value or 0)
     charged_value = 0.0 if bool(entry_courtesy) else float(entry_value or 0)
     with get_conn() as conn:
-        number_row = conn.execute("SELECT nextval('command_number_seq') AS next_number").fetchone()
-        number = int(number_row["next_number"]) if number_row else next_command_number()
+        conn.execute("LOCK TABLE commands IN EXCLUSIVE MODE")
+        number_row = conn.execute("SELECT COALESCE(MAX(number), 99) + 1 AS next_number FROM commands").fetchone()
+        number = int(number_row["next_number"]) if number_row and number_row["next_number"] is not None else 100
         try:
             cur = conn.execute(
                 """
