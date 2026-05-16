@@ -1,5 +1,3 @@
-CREATE SEQUENCE IF NOT EXISTS command_number_seq START WITH 100;
-
 CREATE TABLE IF NOT EXISTS products (
     id SERIAL PRIMARY KEY,
     sku TEXT,
@@ -57,7 +55,7 @@ CREATE TABLE IF NOT EXISTS operators (
 
 CREATE TABLE IF NOT EXISTS commands (
     id SERIAL PRIMARY KEY,
-    number INTEGER NOT NULL UNIQUE DEFAULT nextval('command_number_seq'),
+    number INTEGER NOT NULL UNIQUE,
     status TEXT NOT NULL DEFAULT 'Aberta',
     event_id INTEGER REFERENCES events(id),
     operator_id INTEGER REFERENCES operators(id),
@@ -204,9 +202,3 @@ CREATE INDEX IF NOT EXISTS idx_cash_sessions_status ON cash_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_cash_movements_session_id ON cash_movements(session_id);
 CREATE INDEX IF NOT EXISTS idx_system_logs_created_at ON system_logs(created_at);
 
-ALTER TABLE commands ALTER COLUMN number SET DEFAULT nextval('command_number_seq');
-SELECT setval(
-    'command_number_seq',
-    GREATEST(COALESCE((SELECT MAX(number) FROM commands), 99), 99),
-    true
-);
