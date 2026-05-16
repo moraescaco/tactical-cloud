@@ -3282,11 +3282,18 @@ def page_cash():
 
         st.divider()
         st.write("**Fechar caixa**")
+        closing_amount = st.number_input(
+            "Valor conferido no fechamento",
+            min_value=0.0,
+            value=float(expected),
+            step=10.0,
+            format="%.2f",
+            key=f"cash_close_amount_{session_id}",
+        )
+        diff_preview = float(closing_amount) - float(expected)
+        st.metric("Diferença prevista", brl(diff_preview))
         with st.form("form_close_cash"):
-            closing_amount = st.number_input("Valor conferido no fechamento", min_value=0.0, value=float(expected), step=10.0, format="%.2f")
             close_notes = st.text_area("Observações do fechamento")
-            diff_preview = float(closing_amount) - float(expected)
-            st.metric("Diferença prevista", brl(diff_preview))
             confirm = st.checkbox("Confirmo que conferi o caixa e desejo fechar")
             if st.form_submit_button("Fechar caixa", type="primary"):
                 if not confirm:
