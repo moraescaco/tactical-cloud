@@ -1,11 +1,3 @@
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    from psycopg2 import pool as psycopg2_pool
-except Exception:
-    psycopg2 = None
-    psycopg2_pool = None
-    RealDictCursor = None
 from pathlib import Path
 from datetime import date, datetime, timedelta
 import os
@@ -27,29 +19,15 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from cloud_db import DATABASE_URL, DB_INTEGRITY_ERROR, ensure_database_url, get_conn
 
 
-@st.cache_resource(show_spinner=False)
-def get_pg_pool(database_url):
-    """Reutiliza conexões PostgreSQL no Streamlit Cloud para reduzir lentidão."""
-    if psycopg2 is None or psycopg2_pool is None:
-        return None
-    return psycopg2_pool.SimpleConnectionPool(
-        minconn=1,
-        maxconn=8,
-        dsn=database_url,
-        cursor_factory=RealDictCursor,
-    )
-
-
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 SQL_PROFILE = os.getenv("TACTICAL_SQL_PROFILE", "").strip().lower() in {"1", "true", "yes", "sim"}
 try:
     SLOW_QUERY_SECONDS = float(os.getenv("TACTICAL_SLOW_QUERY_SECONDS", "0.5") or 0.5)
 except ValueError:
     SLOW_QUERY_SECONDS = 0.5
 DEBUG_MIN_STOCK_LOG_PATH = Path(__file__).with_name("debug_min_stock.log")
-DB_INTEGRITY_ERROR = (psycopg2.IntegrityError,) if psycopg2 is not None else tuple()
 ASSETS_DIR = Path(__file__).with_name("assets")
 LOGO_PATH = ASSETS_DIR / "logo_subaquaticos.jpeg"
 LOGO_TRANSPARENT_PATH = ASSETS_DIR / "logo_subaquaticos_transparente.png"
@@ -1278,154 +1256,6 @@ def render_brand_header():
         """,
         unsafe_allow_html=True,
     )
-
-class PgCursorCompat:
-    """Adaptador mínimo para deixar cursores PostgreSQL parecidos com sqlite3.Row."""
-    def __init__(self, cursor, lastrowid=None, rows=None):
-        self._cursor = cursor
-        self.lastrowid = lastrowid
-        self._rows = rows
-
-    def fetchone(self):
-        if self._rows is not None:
-            return self._rows[0] if self._rows else None
-        return self._cursor.fetchone()
-
-    def fetchall(self):
-        if self._rows is not None:
-            return self._rows
-        return self._cursor.fetchall()
-
-    def __iter__(self):
-        return iter(self.fetchall())
-
-
-class PgConnCompat:
-    """Compatibilidade básica para usar conn.execute(...) no PostgreSQL."""
-    def __init__(self):
-        if psycopg2 is None:
-            raise RuntimeError("psycopg2-binary não está instalado. Adicione ao requirements.txt para usar PostgreSQL.")
-        self._pool = get_pg_pool(DATABASE_URL)
-        if self._pool is None:
-            raise RuntimeError("Pool PostgreSQL não pôde ser inicializado.")
-        self._conn = self._pool.getconn()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        if exc_type:
-            self._conn.rollback()
-        self._pool.putconn(self._conn)
-        return False
-
-    def _translate_sql(self, sql):
-        """Converte SQL legado para PostgreSQL sem alterar a lógica principal da query.
-
-        A versão cloud usa PostgreSQL apenas, mas ainda preserva boa parte das queries
-        legadas do sistema original e adapta apenas o necessário:
-        - placeholders ? -> %s
-        - comandos PRAGMA/sqlite_sequence ignorados
-        - strftime simples -> to_char
-        - aliases do SELECT preservados com aspas, porque o PostgreSQL transforma
-          aliases não cotados em minúsculas e o restante do app espera nomes como
-          Data, Total, Valor, Receita, Nome etc.
-        - % literal de LIKE escapado para psycopg2.
-        """
-        sql = str(sql)
-        stripped = sql.strip()
-        upper = stripped.upper()
-        if upper.startswith("PRAGMA") or "SQLITE_SEQUENCE" in upper:
-            return None
-
-        sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO")
-        sql = sql.replace("strftime('%d/%m/%Y', e.event_date)", "to_char(e.event_date::date, 'DD/MM/YYYY')")
-        sql = sql.replace('strftime("%d/%m/%Y", e.event_date)', "to_char(e.event_date::date, 'DD/MM/YYYY')")
-        sql = sql.replace("?", "%s")
-
-        aliases = []
-
-        def quote_alias(match):
-            alias = match.group(1)
-            aliases.append(alias)
-            return f'AS "{alias}"'
-
-        # Preserva aliases em SELECT ... AS Alias.
-        sql = re.sub(
-            r'\bAS\s+([A-Za-z_À-ÿ][A-Za-z0-9_À-ÿ]*)',
-            quote_alias,
-            sql,
-            flags=re.IGNORECASE,
-        )
-
-        # Se a query ordenar por um alias, o PostgreSQL precisa do alias cotado.
-        for alias in sorted(set(aliases), key=len, reverse=True):
-            sql = re.sub(
-                rf'(?<![".])\b{re.escape(alias)}\b(?!")',
-                f'"{alias}"',
-                sql,
-            )
-
-        # psycopg2 usa %s como placeholder; % literal de LIKE deve ser %%.
-        sql = re.sub(r'%(?!s)', '%%', sql)
-        return sql
-
-    def execute(self, sql, params=()):
-        translated = self._translate_sql(sql)
-        if translated is None:
-            return PgCursorCompat(None, rows=[])
-        cur = self._conn.cursor()
-        lastrowid = None
-        stripped = translated.strip()
-        original_upper = str(sql).upper()
-        if "OR IGNORE" in original_upper and stripped.upper().startswith("INSERT INTO") and "ON CONFLICT" not in stripped.upper():
-            translated = stripped.rstrip(';') + " ON CONFLICT DO NOTHING"
-            cur.execute(translated, params)
-            return PgCursorCompat(cur)
-        if stripped.upper().startswith("INSERT INTO") and "ON CONFLICT" not in stripped.upper() and "RETURNING" not in stripped.upper():
-            translated = stripped.rstrip(';') + " RETURNING id"
-            cur.execute(translated, params)
-            try:
-                row = cur.fetchone()
-                if row and "id" in row:
-                    lastrowid = row["id"]
-            except Exception:
-                lastrowid = None
-            return PgCursorCompat(cur, lastrowid=lastrowid)
-        if "INSERT INTO" in stripped.upper() and "ON CONFLICT DO NOTHING" not in stripped.upper() and "OR IGNORE" not in original_upper:
-            cur.execute(translated, params)
-        else:
-            # Compatibilidade com INSERT OR IGNORE do SQLite.
-            if "INSERT INTO" in stripped.upper() and "ON CONFLICT" not in stripped.upper():
-                translated = stripped.rstrip(';') + " ON CONFLICT DO NOTHING"
-            cur.execute(translated, params)
-        return PgCursorCompat(cur)
-
-    def executescript(self, sql_script):
-        cur = self._conn.cursor()
-        for statement in str(sql_script).split(';'):
-            statement = statement.strip()
-            if not statement or statement.upper().startswith('PRAGMA'):
-                continue
-            translated = self._translate_sql(statement)
-            if translated:
-                cur.execute(translated)
-        return PgCursorCompat(cur)
-
-    def commit(self):
-        self._conn.commit()
-
-    def rollback(self):
-        self._conn.rollback()
-
-    def close(self):
-        self._conn.close()
-
-
-def get_conn():
-    return PgConnCompat()
-
-
 def init_db():
     """Cria/atualiza a estrutura básica no PostgreSQL."""
     schema_path = Path(__file__).with_name("schema_postgres.sql")
@@ -1659,6 +1489,46 @@ def execute(sql, params=()):
         conn.commit()
         _bump_cache_version()
         return getattr(cur, "lastrowid", None)
+
+
+def current_product_stock(conn, product_id):
+    product = conn.execute(
+        "SELECT id, name, sku, stock_qty, cost_unit FROM products WHERE id = ?",
+        (int(product_id),),
+    ).fetchone()
+    if not product:
+        raise ValueError("Produto nÃ£o encontrado.")
+    return product
+
+
+def reserve_product_stock(conn, product_id, qty):
+    qty = float(qty)
+    reserved = conn.execute(
+        """
+        UPDATE products
+        SET stock_qty = stock_qty - ?
+        WHERE id = ? AND stock_qty >= ?
+        RETURNING id, name, sku, stock_qty, cost_unit
+        """,
+        (qty, int(product_id), qty),
+    ).fetchone()
+    if reserved:
+        return reserved
+    product = current_product_stock(conn, product_id)
+    available = float(product["stock_qty"] or 0)
+    raise ValueError(f"Estoque insuficiente. DisponÃ­vel: {available:g}")
+
+
+def sum_cash_movements_for_session(conn, session_id):
+    return conn.execute(
+        """
+        SELECT movement_type, COALESCE(SUM(amount), 0) AS total
+        FROM cash_movements
+        WHERE session_id = ?
+        GROUP BY movement_type
+        """,
+        (int(session_id),),
+    ).fetchall()
 
 
 def record_stock_movement(conn, movement_date, product_id, event_id, movement_type, qty, unit_cost=0, unit_price=0, notes=""):
@@ -2519,7 +2389,12 @@ def command_options(status=None):
 
 
 def next_command_number():
-    df = query_df("SELECT COALESCE(MAX(number), 99) + 1 AS next_number FROM commands")
+    df = query_df(
+        """
+        SELECT GREATEST(last_value + CASE WHEN is_called THEN 1 ELSE 0 END, 100) AS next_number
+        FROM command_number_seq
+        """
+    )
     n = int(df["next_number"].iloc[0]) if not df.empty else 100
     return max(n, 100)
 
@@ -2587,32 +2462,42 @@ def create_command(opened_at, event_id, operator_id, customer_name, entry_type, 
             "Não é permitido abrir mais de uma comanda para o mesmo cadastro no mesmo jogo."
         )
 
-    number = next_command_number()
     original_value = float(entry_value if entry_original_value is None else entry_original_value or 0)
     charged_value = 0.0 if bool(entry_courtesy) else float(entry_value or 0)
-    command_id = execute(
-        """
-        INSERT INTO commands (
-            number, status, event_id, operator_id, customer_name, entry_type,
-            entry_value, entry_original_value, entry_courtesy, entry_courtesy_reason,
-            opened_at, notes
-        )
-        VALUES (?, 'Aberta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            number,
-            event_id,
-            operator_id,
-            customer_name.strip() if customer_name else None,
-            entry_type,
-            charged_value,
-            original_value,
-            1 if bool(entry_courtesy) else 0,
-            entry_courtesy_reason.strip() if entry_courtesy_reason else None,
-            str(opened_at),
-            notes,
-        ),
-    )
+    with get_conn() as conn:
+        number_row = conn.execute("SELECT nextval('command_number_seq') AS next_number").fetchone()
+        number = int(number_row["next_number"]) if number_row else next_command_number()
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO commands (
+                    number, status, event_id, operator_id, customer_name, entry_type,
+                    entry_value, entry_original_value, entry_courtesy, entry_courtesy_reason,
+                    opened_at, notes
+                )
+                VALUES (?, 'Aberta', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    number,
+                    event_id,
+                    operator_id,
+                    customer_name.strip() if customer_name else None,
+                    entry_type,
+                    charged_value,
+                    original_value,
+                    1 if bool(entry_courtesy) else 0,
+                    entry_courtesy_reason.strip() if entry_courtesy_reason else None,
+                    str(opened_at),
+                    notes,
+                ),
+            )
+        except DB_INTEGRITY_ERROR:
+            raise ValueError(
+                "Este operador/jogador jÃ¡ possui uma comanda ativa neste jogo. Atualize a comanda existente em vez de abrir outra."
+            ) from None
+        command_id = getattr(cur, "lastrowid", None)
+        conn.commit()
+        _bump_cache_version()
     sync_event_from_commands(event_id)
     cortesia_txt = f" | Cortesia: sim | Valor original: {brl(original_value)} | Motivo: {entry_courtesy_reason or '-'}" if entry_courtesy else ""
     log_action("criou_comanda", f"Comanda #{number} criada | Tipo de entrada: {entry_type} | Valor cobrado: {brl(charged_value)}{cortesia_txt}")
@@ -2731,8 +2616,429 @@ def get_command(command_id):
     )
     return None if df.empty else df.iloc[0]
 
+def cash_expected_amount(session_id):
+    with get_conn() as conn:
+        session = conn.execute("SELECT opening_amount FROM cash_sessions WHERE id = ?", (session_id,)).fetchone()
+        opening = float(session["opening_amount"] or 0) if session else 0.0
+        rows = sum_cash_movements_for_session(conn, session_id)
+    total = opening
+    for row in rows:
+        movement_type = str(row["movement_type"])
+        amount = float(row["total"] or 0)
+        total = total - amount if movement_type == "Saída" else total + amount
+    return total
 
 
+def close_command(command_id, discount_percent=0.0, payment_method="Dinheiro", entry_courtesy=None, entry_courtesy_reason=""):
+    discount_percent = max(0.0, min(float(discount_percent or 0), 100.0))
+
+    with get_conn() as conn:
+        cash = conn.execute(
+            "SELECT * FROM cash_sessions WHERE status = 'Aberto' ORDER BY id DESC LIMIT 1 FOR UPDATE"
+        ).fetchone()
+        if cash is None:
+            raise ValueError("Abra um caixa antes de fechar comandas. Vá em Caixa > Abrir caixa.")
+
+        locked_command = conn.execute(
+            """
+            SELECT id, number, status, event_id, entry_value, entry_original_value
+            FROM commands
+            WHERE id = ?
+            FOR UPDATE
+            """,
+            (int(command_id),),
+        ).fetchone()
+        if not locked_command:
+            raise ValueError("Comanda não encontrada.")
+        if locked_command["status"] != "Aberta":
+            raise ValueError("A comanda precisa estar aberta para ser fechada.")
+
+        if entry_courtesy is not None:
+            current_entry = float(locked_command["entry_value"] or 0)
+            original_entry = float(locked_command["entry_original_value"] or 0)
+            if original_entry <= 0:
+                original_entry = current_entry
+            new_entry_value = 0.0 if bool(entry_courtesy) else original_entry
+            conn.execute(
+                """
+                UPDATE commands
+                SET entry_value = ?, entry_original_value = ?, entry_courtesy = ?, entry_courtesy_reason = ?
+                WHERE id = ?
+                """,
+                (
+                    float(new_entry_value),
+                    float(original_entry),
+                    1 if bool(entry_courtesy) else 0,
+                    entry_courtesy_reason.strip() if bool(entry_courtesy) and entry_courtesy_reason else None,
+                    int(command_id),
+                ),
+            )
+
+        subtotal_row = conn.execute(
+            """
+            SELECT COALESCE(c.entry_value, 0) + COALESCE(SUM(s.revenue), 0) AS subtotal,
+                   c.number AS number,
+                   c.event_id AS event_id
+            FROM commands c
+            LEFT JOIN sales s ON s.command_id = c.id
+            WHERE c.id = ?
+            GROUP BY c.id
+            """,
+            (int(command_id),),
+        ).fetchone()
+        subtotal = float(subtotal_row["subtotal"]) if subtotal_row else 0.0
+        command_number = int(subtotal_row["number"]) if subtotal_row else int(command_id)
+        event_id = int(subtotal_row["event_id"]) if subtotal_row and subtotal_row["event_id"] is not None else None
+        discount_amount = subtotal * discount_percent / 100.0
+        total_final = subtotal - discount_amount
+
+        existing_receipt = conn.execute(
+            """
+            SELECT id
+            FROM cash_movements
+            WHERE command_id = ? AND movement_type = 'Entrada'
+            LIMIT 1
+            """,
+            (int(command_id),),
+        ).fetchone()
+        if existing_receipt:
+            raise ValueError("Esta comanda já possui um recebimento registrado no caixa.")
+
+        conn.execute(
+            """
+            UPDATE commands
+            SET status = 'Fechada', closed_at = ?, discount_percent = ?, discount_amount = ?
+            WHERE id = ? AND status = 'Aberta'
+            """,
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), discount_percent, discount_amount, int(command_id)),
+        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO cash_movements (session_id, movement_type, description, amount, payment_method, command_id, created_by, notes)
+                VALUES (?, 'Entrada', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(cash["id"]),
+                    f"Recebimento da comanda #{command_number}",
+                    float(total_final),
+                    payment_method,
+                    int(command_id),
+                    (current_user() or {}).get("id"),
+                    f"Subtotal {brl(subtotal)} | Desconto {discount_percent:.2f}% ({brl(discount_amount)})",
+                ),
+            )
+        except DB_INTEGRITY_ERROR:
+            raise ValueError("Esta comanda já possui um recebimento registrado no caixa.") from None
+        conn.commit()
+        _bump_cache_version()
+
+    if event_id:
+        sync_event_from_commands(event_id)
+    courtesy_txt = f" | Entrada em cortesia: {'sim' if entry_courtesy else 'não'}"
+    if entry_courtesy:
+        courtesy_txt += f" | Motivo: {entry_courtesy_reason or '-'}"
+    log_action("fechou_comanda", f"Comanda #{command_number} fechada em {payment_method}: {brl(total_final)}{courtesy_txt}")
+    log_action("pagamento_recebido", f"Comanda #{command_number} | Tipo de pagamento: {payment_method} | Valor recebido: {brl(total_final)} | Desconto: {discount_percent:.2f}% ({brl(discount_amount)}){courtesy_txt}")
+
+
+def reopen_command(command_id):
+    with get_conn() as conn:
+        command = conn.execute(
+            """
+            SELECT id, number, status, event_id
+            FROM commands
+            WHERE id = ?
+            FOR UPDATE
+            """,
+            (int(command_id),),
+        ).fetchone()
+        if not command:
+            raise ValueError("Comanda não encontrada.")
+        if command["status"] != "Fechada":
+            raise ValueError("Somente comandas fechadas podem ser reabertas.")
+
+        receipt = conn.execute(
+            """
+            SELECT cm.id, cs.status AS session_status
+            FROM cash_movements cm
+            LEFT JOIN cash_sessions cs ON cs.id = cm.session_id
+            WHERE cm.command_id = ? AND cm.movement_type = 'Entrada'
+            ORDER BY cm.id DESC
+            LIMIT 1
+            FOR UPDATE
+            """,
+            (int(command_id),),
+        ).fetchone()
+        if receipt:
+            if receipt["session_status"] != "Aberto":
+                raise ValueError(
+                    "Esta comanda foi recebida em um caixa já fechado. Reabra ou ajuste o caixa correspondente antes de reabrir a comanda."
+                )
+            conn.execute("DELETE FROM cash_movements WHERE id = ?", (int(receipt["id"]),))
+
+        conn.execute(
+            """
+            UPDATE commands
+            SET status = 'Aberta', closed_at = NULL, discount_percent = 0, discount_amount = 0
+            WHERE id = ?
+            """,
+            (int(command_id),),
+        )
+        conn.commit()
+        _bump_cache_version()
+        event_id = int(command["event_id"]) if command["event_id"] is not None else None
+        command_number = int(command["number"] or 0)
+    if event_id:
+        sync_event_from_commands(event_id)
+    log_action("reabriu_comanda", f"Comanda #{command_number} reaberta")
+
+
+def cancel_command(command_id):
+    with get_conn() as conn:
+        command = conn.execute(
+            """
+            SELECT id, number, status, event_id
+            FROM commands
+            WHERE id = ?
+            FOR UPDATE
+            """,
+            (int(command_id),),
+        ).fetchone()
+        if not command:
+            raise ValueError("Comanda não encontrada.")
+        if command["status"] == "Cancelada":
+            raise ValueError("Esta comanda já está cancelada.")
+        if command["status"] == "Fechada":
+            raise ValueError("Não é possível cancelar uma comanda fechada. Reabra a comanda antes, se isso fizer sentido na operação.")
+
+        total = conn.execute(
+            "SELECT COUNT(*) AS qtd FROM sales WHERE command_id = ?",
+            (int(command_id),),
+        ).fetchone()
+        if int(total["qtd"] or 0) > 0:
+            raise ValueError("Não é possível cancelar uma comanda que já possui vendas. Exclua/estorne os lançamentos manualmente antes.")
+
+        conn.execute(
+            "UPDATE commands SET status = 'Cancelada', closed_at = ? WHERE id = ?",
+            (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), int(command_id)),
+        )
+        conn.commit()
+        _bump_cache_version()
+        event_id = int(command["event_id"]) if command["event_id"] is not None else None
+        command_number = int(command["number"] or 0)
+    if event_id:
+        sync_event_from_commands(event_id)
+    log_action("cancelou_comanda", f"Comanda #{command_number} cancelada")
+
+
+def open_cash(opening_amount, notes=""):
+    if float(opening_amount) <= 0:
+        raise ValueError("Informe um valor inicial maior que zero para abrir o caixa.")
+    user_id = (current_user() or {}).get("id")
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO cash_sessions (status, opening_amount, expected_amount, opened_by, notes)
+                VALUES ('Aberto', ?, ?, ?, ?)
+                """,
+                (float(opening_amount), float(opening_amount), user_id, notes),
+            )
+        except DB_INTEGRITY_ERROR:
+            raise ValueError("Já existe um caixa aberto. Feche o caixa atual antes de abrir outro.") from None
+        cash_id = getattr(cur, "lastrowid", None)
+        conn.commit()
+        _bump_cache_version()
+    log_action("abriu_caixa", f"Caixa aberto com {brl(opening_amount)}")
+    return cash_id
+
+
+def close_cash(session_id, closing_amount, notes=""):
+    user_id = (current_user() or {}).get("id")
+    with get_conn() as conn:
+        session = conn.execute(
+            "SELECT id, opening_amount FROM cash_sessions WHERE id = ? AND status = 'Aberto' FOR UPDATE",
+            (int(session_id),),
+        ).fetchone()
+        if not session:
+            raise ValueError("Caixa não encontrado ou já fechado.")
+
+        opening = float(session["opening_amount"] or 0)
+        rows = sum_cash_movements_for_session(conn, session_id)
+        expected = opening
+        for row in rows:
+            amount = float(row["total"] or 0)
+            expected = expected - amount if str(row["movement_type"]) == "Saída" else expected + amount
+        difference = float(closing_amount) - float(expected)
+
+        conn.execute(
+            """
+            UPDATE cash_sessions
+            SET status = 'Fechado', closed_at = CURRENT_TIMESTAMP, expected_amount = ?, closing_amount = ?, difference_amount = ?, closed_by = ?, notes = COALESCE(notes, '') || ?
+            WHERE id = ? AND status = 'Aberto'
+            """,
+            (float(expected), float(closing_amount), float(difference), user_id, f"\nFechamento: {notes}" if notes else "", int(session_id)),
+        )
+        conn.commit()
+        _bump_cache_version()
+    log_action("fechou_caixa", f"Caixa fechado. Esperado {brl(expected)}, conferido {brl(closing_amount)}, diferença {brl(difference)}")
+    return expected, difference
+
+
+def add_sale(sale_date, product_id, event_id, qty, unit_price, notes, command_id=None, operator_id=None):
+    log_details = None
+    qty = float(qty)
+    unit_price = float(unit_price)
+    if qty <= 0:
+        raise ValueError("A quantidade precisa ser maior que zero.")
+
+    with get_conn() as conn:
+        reserved_product = reserve_product_stock(conn, product_id, qty)
+        cost_unit = float(reserved_product["cost_unit"] or 0)
+        revenue = qty * unit_price
+        cogs = qty * cost_unit
+
+        merged_existing_item = False
+        existing_item = None
+        if command_id:
+            existing_item = conn.execute(
+                """
+                SELECT id, qty, revenue, cogs, notes
+                FROM sales
+                WHERE command_id = ? AND product_id = ?
+                ORDER BY id ASC
+                LIMIT 1
+                """,
+                (int(command_id), int(product_id)),
+            ).fetchone()
+
+        if existing_item:
+            merged_existing_item = True
+            old_qty = float(existing_item["qty"] or 0)
+            old_revenue = float(existing_item["revenue"] or 0)
+            old_cogs = float(existing_item["cogs"] or 0)
+            new_qty = old_qty + qty
+            new_revenue = old_revenue + revenue
+            new_cogs = old_cogs + cogs
+            new_unit_price = new_revenue / new_qty if new_qty else unit_price
+            merged_notes = existing_item["notes"] or ""
+            if notes and notes not in merged_notes:
+                merged_notes = (merged_notes + " | " if merged_notes else "") + str(notes)
+            conn.execute(
+                """
+                UPDATE sales
+                SET qty = ?, unit_price = ?, revenue = ?, cogs = ?, notes = ?
+                WHERE id = ?
+                """,
+                (new_qty, new_unit_price, new_revenue, new_cogs, merged_notes, int(existing_item["id"])),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO sales (sale_date, product_id, event_id, command_id, operator_id, qty, unit_price, revenue, cost_unit_at_sale, cogs, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (str(sale_date), product_id, event_id, command_id, operator_id, qty, unit_price, revenue, cost_unit, cogs, notes),
+            )
+
+        record_stock_movement(conn, sale_date, product_id, event_id, "Venda/baixa", -qty, cost_unit, unit_price, notes)
+        if command_id:
+            cmd = conn.execute(
+                """
+                SELECT c.number, COALESCE(o.name, '-') AS operator_name, COALESCE(e.name, '-') AS event_name
+                FROM commands c
+                LEFT JOIN operators o ON o.id = c.operator_id
+                LEFT JOIN events e ON e.id = c.event_id
+                WHERE c.id = ?
+                """,
+                (int(command_id),),
+            ).fetchone()
+            command_number = int(cmd["number"]) if cmd else int(command_id)
+            operator_name = cmd["operator_name"] if cmd else "-"
+            event_name = cmd["event_name"] if cmd else "-"
+            product_name = reserved_product["name"]
+            sku = reserved_product["sku"] or "sem SKU"
+            merge_txt = " | Item somado ao card existente" if merged_existing_item else ""
+            log_details = (
+                f"Comanda #{command_number} | Jogo: {event_name} | Operador/jogador: {operator_name} | "
+                f"Produto: {product_name} ({sku}) | Qtd adicionada: {qty:g} | Preço unitário: {brl(unit_price)} | Total adicionado: {brl(revenue)}{merge_txt}"
+            )
+        conn.commit()
+        _bump_cache_version()
+    if log_details:
+        log_action("venda_adicionada_comanda", log_details)
+
+
+def update_command_sale(sale_id, new_product_id, new_qty, new_unit_price, notes=""):
+    new_qty = float(new_qty)
+    new_unit_price = float(new_unit_price)
+    if new_qty <= 0:
+        raise ValueError("A quantidade precisa ser maior que zero.")
+    if new_unit_price < 0:
+        raise ValueError("O preço unitário não pode ser negativo.")
+
+    with get_conn() as conn:
+        sale = conn.execute(
+            """
+            SELECT s.*, c.number AS command_number, c.status AS command_status
+            FROM sales s
+            LEFT JOIN commands c ON c.id = s.command_id
+            WHERE s.id = ?
+            """,
+            (int(sale_id),),
+        ).fetchone()
+        if not sale:
+            raise ValueError("Item não encontrado.")
+        if sale["command_id"] is None:
+            raise ValueError("Este item não pertence a uma comanda.")
+        if sale["command_status"] != "Aberta":
+            raise ValueError("Só é possível editar itens de comandas abertas.")
+
+        old_product_id = int(sale["product_id"])
+        old_qty = float(sale["qty"])
+        old_cost_unit = float(sale["cost_unit_at_sale"] or 0)
+        event_id = sale["event_id"]
+        command_number = int(sale["command_number"] or 0)
+
+        conn.execute("UPDATE products SET stock_qty = stock_qty + ? WHERE id = ?", (old_qty, old_product_id))
+        record_stock_movement(
+            conn,
+            date.today(),
+            old_product_id,
+            event_id,
+            "Estorno por edição de comanda",
+            old_qty,
+            old_cost_unit,
+            float(sale["unit_price"] or 0),
+            f"Edição do item {sale_id} da comanda #{command_number}",
+        )
+
+        new_product = reserve_product_stock(conn, new_product_id, new_qty)
+        new_cost_unit = float(new_product["cost_unit"] or 0)
+        new_revenue = new_qty * new_unit_price
+        new_cogs = new_qty * new_cost_unit
+        conn.execute(
+            """
+            UPDATE sales
+            SET product_id = ?, qty = ?, unit_price = ?, revenue = ?, cost_unit_at_sale = ?, cogs = ?, notes = ?
+            WHERE id = ?
+            """,
+            (int(new_product_id), new_qty, new_unit_price, new_revenue, new_cost_unit, new_cogs, notes, int(sale_id)),
+        )
+        record_stock_movement(
+            conn,
+            date.today(),
+            int(new_product_id),
+            event_id,
+            "Baixa por edição de comanda",
+            -new_qty,
+            new_cost_unit,
+            new_unit_price,
+            f"Edição do item {sale_id} da comanda #{command_number}",
+        )
+        conn.commit()
+        _bump_cache_version()
 
 
 FORMAS_PAGAMENTO = ["Dinheiro", "Pix", "Cartão de débito", "Cartão de crédito", "Cortesia", "Outro"]
@@ -2810,6 +3116,73 @@ def close_cash(session_id, closing_amount, notes=""):
         """,
         (float(expected), float(closing_amount), float(difference), user_id, f"\nFechamento: {notes}" if notes else "", int(session_id)),
     )
+    log_action("fechou_caixa", f"Caixa fechado. Esperado {brl(expected)}, conferido {brl(closing_amount)}, diferença {brl(difference)}")
+    return expected, difference
+
+
+def cash_expected_amount(session_id):
+    with get_conn() as conn:
+        session = conn.execute("SELECT opening_amount FROM cash_sessions WHERE id = ?", (session_id,)).fetchone()
+        opening = float(session["opening_amount"] or 0) if session else 0.0
+        rows = sum_cash_movements_for_session(conn, session_id)
+    total = opening
+    for row in rows:
+        movement_type = str(row["movement_type"])
+        amount = float(row["total"] or 0)
+        total = total - amount if movement_type == "Saída" else total + amount
+    return total
+
+
+def open_cash(opening_amount, notes=""):
+    if float(opening_amount) <= 0:
+        raise ValueError("Informe um valor inicial maior que zero para abrir o caixa.")
+    user_id = (current_user() or {}).get("id")
+    with get_conn() as conn:
+        try:
+            cur = conn.execute(
+                """
+                INSERT INTO cash_sessions (status, opening_amount, expected_amount, opened_by, notes)
+                VALUES ('Aberto', ?, ?, ?, ?)
+                """,
+                (float(opening_amount), float(opening_amount), user_id, notes),
+            )
+        except DB_INTEGRITY_ERROR:
+            raise ValueError("Já existe um caixa aberto. Feche o caixa atual antes de abrir outro.") from None
+        cash_id = getattr(cur, "lastrowid", None)
+        conn.commit()
+        _bump_cache_version()
+    log_action("abriu_caixa", f"Caixa aberto com {brl(opening_amount)}")
+    return cash_id
+
+
+def close_cash(session_id, closing_amount, notes=""):
+    user_id = (current_user() or {}).get("id")
+    with get_conn() as conn:
+        session = conn.execute(
+            "SELECT id, opening_amount FROM cash_sessions WHERE id = ? AND status = 'Aberto' FOR UPDATE",
+            (int(session_id),),
+        ).fetchone()
+        if not session:
+            raise ValueError("Caixa não encontrado ou já fechado.")
+
+        opening = float(session["opening_amount"] or 0)
+        rows = sum_cash_movements_for_session(conn, session_id)
+        expected = opening
+        for row in rows:
+            amount = float(row["total"] or 0)
+            expected = expected - amount if str(row["movement_type"]) == "Saída" else expected + amount
+        difference = float(closing_amount) - float(expected)
+
+        conn.execute(
+            """
+            UPDATE cash_sessions
+            SET status = 'Fechado', closed_at = CURRENT_TIMESTAMP, expected_amount = ?, closing_amount = ?, difference_amount = ?, closed_by = ?, notes = COALESCE(notes, '') || ?
+            WHERE id = ? AND status = 'Aberto'
+            """,
+            (float(expected), float(closing_amount), float(difference), user_id, f"\nFechamento: {notes}" if notes else "", int(session_id)),
+        )
+        conn.commit()
+        _bump_cache_version()
     log_action("fechou_caixa", f"Caixa fechado. Esperado {brl(expected)}, conferido {brl(closing_amount)}, diferença {brl(difference)}")
     return expected, difference
 

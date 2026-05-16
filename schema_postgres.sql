@@ -1,3 +1,5 @@
+CREATE SEQUENCE IF NOT EXISTS command_number_seq START WITH 100;
+
 CREATE TABLE IF NOT EXISTS products (
     id SERIAL PRIMARY KEY,
     sku TEXT,
@@ -55,7 +57,7 @@ CREATE TABLE IF NOT EXISTS operators (
 
 CREATE TABLE IF NOT EXISTS commands (
     id SERIAL PRIMARY KEY,
-    number INTEGER NOT NULL UNIQUE,
+    number INTEGER NOT NULL UNIQUE DEFAULT nextval('command_number_seq'),
     status TEXT NOT NULL DEFAULT 'Aberta',
     event_id INTEGER REFERENCES events(id),
     operator_id INTEGER REFERENCES operators(id),
@@ -168,6 +170,18 @@ CREATE TABLE IF NOT EXISTS system_logs (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_products_sku_unique ON products(sku) WHERE sku IS NOT NULL AND TRIM(sku) <> '';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email_unique ON system_users(email) WHERE email IS NOT NULL AND TRIM(email) <> '';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_commands_event_operator_unique_active
+    ON commands(event_id, operator_id)
+    WHERE event_id IS NOT NULL
+      AND operator_id IS NOT NULL
+      AND status <> 'Cancelada';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_sessions_single_open
+    ON cash_sessions(status)
+    WHERE status = 'Aberto';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cash_movements_command_receipt_unique
+    ON cash_movements(command_id)
+    WHERE command_id IS NOT NULL
+      AND movement_type = 'Entrada';
 
 -- Índices para melhorar performance em ambiente cloud/PostgreSQL.
 CREATE INDEX IF NOT EXISTS idx_events_status ON events(status);
@@ -189,3 +203,10 @@ CREATE INDEX IF NOT EXISTS idx_stock_movements_movement_date ON stock_movements(
 CREATE INDEX IF NOT EXISTS idx_cash_sessions_status ON cash_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_cash_movements_session_id ON cash_movements(session_id);
 CREATE INDEX IF NOT EXISTS idx_system_logs_created_at ON system_logs(created_at);
+
+ALTER TABLE commands ALTER COLUMN number SET DEFAULT nextval('command_number_seq');
+SELECT setval(
+    'command_number_seq',
+    GREATEST(COALESCE((SELECT MAX(number) FROM commands), 99), 99),
+    true
+);
