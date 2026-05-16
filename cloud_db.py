@@ -15,6 +15,19 @@ import streamlit as st
 
 DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 DB_INTEGRITY_ERROR = (psycopg2.IntegrityError,) if psycopg2 is not None else tuple()
+SQL_TYPE_KEYWORDS = {
+    "TEXT",
+    "INTEGER",
+    "REAL",
+    "NUMERIC",
+    "BLOB",
+    "DATE",
+    "TIMESTAMP",
+    "BOOLEAN",
+    "DOUBLE",
+    "PRECISION",
+    "SERIAL",
+}
 
 
 @st.cache_resource(show_spinner=False)
@@ -97,6 +110,8 @@ class PgConnCompat:
 
         def quote_alias(match):
             alias = match.group(1)
+            if alias.upper() in SQL_TYPE_KEYWORDS:
+                return f"AS {alias}"
             aliases.append(alias)
             return f'AS "{alias}"'
 

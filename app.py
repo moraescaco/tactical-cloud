@@ -3714,7 +3714,7 @@ def page_operators():
                 FROM commands c
                 LEFT JOIN events e ON e.id = c.event_id
                 WHERE c.operator_id = o.id
-                ORDER BY COALESCE(c.opened_at, CAST(c.created_at AS TEXT)) DESC, c.id DESC
+                ORDER BY COALESCE(c.opened_at, to_char(c.created_at, 'YYYY-MM-DD HH24:MI:SS')) DESC, c.id DESC
                 LIMIT 1
             ) AS Ultimo_jogo,
             CASE WHEN o.active = 1 THEN 'Ativo' ELSE 'Inativo' END AS Status
