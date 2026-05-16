@@ -1,5 +1,6 @@
 from pathlib import Path
 from datetime import date, datetime, timedelta
+import importlib.util
 import os
 import hashlib
 import hmac
@@ -19,7 +20,19 @@ logging.getLogger("streamlit.runtime.scriptrunner_utils.script_run_context").set
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
-from cloud_db import DATABASE_URL, DB_INTEGRITY_ERROR, ensure_database_url, get_conn
+try:
+    from cloud_db import DATABASE_URL, DB_INTEGRITY_ERROR, ensure_database_url, get_conn
+except (KeyError, ModuleNotFoundError, ImportError):
+    _cloud_db_path = Path(__file__).with_name("cloud_db.py")
+    _cloud_db_spec = importlib.util.spec_from_file_location("cloud_db_fallback", _cloud_db_path)
+    if _cloud_db_spec is None or _cloud_db_spec.loader is None:
+        raise
+    _cloud_db_module = importlib.util.module_from_spec(_cloud_db_spec)
+    _cloud_db_spec.loader.exec_module(_cloud_db_module)
+    DATABASE_URL = _cloud_db_module.DATABASE_URL
+    DB_INTEGRITY_ERROR = _cloud_db_module.DB_INTEGRITY_ERROR
+    ensure_database_url = _cloud_db_module.ensure_database_url
+    get_conn = _cloud_db_module.get_conn
 
 
 SQL_PROFILE = os.getenv("TACTICAL_SQL_PROFILE", "").strip().lower() in {"1", "true", "yes", "sim"}
